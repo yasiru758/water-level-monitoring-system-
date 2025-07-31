@@ -1,0 +1,491 @@
+#define BLYNK_TEMPLATE_ID "TMPL6c5t609oT" 
+#define BLYNK_TEMPLATE_NAME "Tank Water Level Monitoring System"
+#define BLYNK_AUTH_TOKEN "EGK0W-H_YWa5rVfrJykeE8MPxefrcjKx"
+
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+
+// WiFi credentials
+char ssid[] = "Sumu";
+char pass[] = "Alexsumu1*";
+
+// GPIO pins
+#define PUMP_RELAY_PIN  27
+#define BUZZER_PIN      14
+#define OLED_SDA        21
+#define OLED_SCL        22
+
+// OLED display object
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=/ U8X8_PIN_NONE, / clock=/ OLED_SCL, / data=*/ OLED_SDA);
+
+// Structure to receive sensor data from sensor ESP32
+typedef struct struct_message {
+  int waterLevel;
+  float distance;
+  bool sensorStatus;
+} struct_message;
+
+struct_message incomingData;
+
+// Global variables
+int tankLevelPercent = 0;
+bool pumpState = false;
+bool buzzerState = false;
+unsigned long lastSensorUpdate = 0;
+unsigned long buzzerStartTime = 0;
+bool sensorConnected = false;
+const unsigned long SENSOR_TIMEOUT = 10000; // 10 seconds timeout
+const int TANK_HEIGHT_CM = 200;
+
+// Automatic control thresholds
+const int PUMP_ON_THRESHOLD = 10;   // Turn pump ON when water level < 10%
+const int PUMP_OFF_THRESHOLD = 95;  // Turn pump OFF when water level >= 95%
+
+// Blynk Virtual Pins
+#define VPIN_WATER_LEVEL    V0  // Gauge for water level percentage
+#define VPIN_PUMP_STATUS    V1  // LED for pump status
+#define VPIN_PUMP_CONTROL   V2  // Button for pump control
+
+// Web server listening on port 80
+WebServer server(80);
+
+// Function to draw on OLED display
+void drawOLED() {
+  u8g2.clearBuffer();
+
+  // Title
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  u8g2.drawStr(0, 12, "Tank Water Level");
+
+  // Water level percentage (large font)
+  u8g2.setFont(u8g2_font_fub20_tr);
+  u8g2.setCursor(10, 40);
+  u8g2.print(tankLevelPercent);
+  u8g2.print("%");
+
+  // Pump status
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  if (pumpState) {
+    u8g2.drawStr(60, 55, "Pump: ON");
+  } else {
+    u8g2.drawStr(60, 55, "Pump: OFF");
+  }
+
+  // Sensor connection status
+  if (sensorConnected) {
+    u8g2.drawStr(0, 55, "Sensor: OK");
+  } else {
+    u8g2.drawStr(0, 55, "Sensor: ERR");
+  }
+
+  // Tank status
+  if (tankLevelPercent >= 95) {
+    u8g2.drawStr(0, 64, "TANK HIGH!");
+  } else if (tankLevelPercent <= 10) {
+    u8g2.drawStr(0, 64, "LOW WATER");
+  } else {
+    u8g2.drawStr(0, 64, "Normal");
+  }
+
+  u8g2.sendBuffer();
+}
+
+// Function to get status color based on water level
+String getStatusColor(int level) {
+  if (level >= 80) return "green";
+  else if (level >= 50) return "yellow";
+  else if (level >= 20) return "orange";
+  else return "red";
+}
+
+// Function to get tank status text
+String getTankStatus(int level) {
+  if (level >= 95) return "HIGH LEVEL";
+  else if (level >= 80) return "High Level";
+  else if (level >= 50) return "Medium Level";
+  else if (level >= 20) return "Low Level";
+  else return "Very Low";
+}
+
+// ESP-NOW callback function when data is received from sensor ESP32
+void OnDataRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  if (len != sizeof(incomingData)) return;
+
+  memcpy(&incomingData, data, sizeof(incomingData));
+
+  // Update global variables
+  tankLevelPercent = constrain(incomingData.waterLevel, 0, 100);
+  sensorConnected = incomingData.sensorStatus;
+  lastSensorUpdate = millis();
+
+  Serial.println("========================================");
+  Serial.println("RECEIVED SENSOR DATA via ESP-NOW:");
+  Serial.println("   Water level: " + String(tankLevelPercent) + "%");
+  Serial.println("   Distance: " + String(incomingData.distance, 2) + " cm");
+  Serial.println("   Sensor status: " + String(incomingData.sensorStatus ? "OK" : "Error"));
+
+  // AUTOMATIC PUMP CONTROL LOGIC
+  // Turn ON pump when water level is less than 10%
+  if (tankLevelPercent < PUMP_ON_THRESHOLD && !pumpState) {
+    pumpState = true;
+    digitalWrite(PUMP_RELAY_PIN, HIGH);
+    Serial.println("AUTO PUMP ON: Water level is " + String(tankLevelPercent) + "% (< " + String(PUMP_ON_THRESHOLD) + "%)");
+    Blynk.virtualWrite(VPIN_PUMP_STATUS, 1);
+    Blynk.virtualWrite(VPIN_PUMP_CONTROL, 1);
+  }
+  
+  // Turn OFF pump when water level is 95% or more
+  if (tankLevelPercent >= PUMP_OFF_THRESHOLD && pumpState) {
+    pumpState = false;
+    digitalWrite(PUMP_RELAY_PIN, LOW);
+    Serial.println("AUTO PUMP OFF: Water level is " + String(tankLevelPercent) + "% (>= " + String(PUMP_OFF_THRESHOLD) + "%)");
+    Blynk.virtualWrite(VPIN_PUMP_STATUS, 0);
+    Blynk.virtualWrite(VPIN_PUMP_CONTROL, 0);
+  }
+
+  // AUTOMATIC BUZZER CONTROL LOGIC
+  // Turn ON buzzer when water level is less than 12%
+  if (tankLevelPercent < 12 && !buzzerState) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    buzzerState = true;
+    buzzerStartTime = millis();
+    Serial.println("AUTO BUZZER ON: Water level is " + String(tankLevelPercent) + "% (< 12%)");
+  }
+  
+  // Turn OFF buzzer when water level is 12% or more (but not when tank is >= 95%)
+  if (tankLevelPercent >= 12 && buzzerState && tankLevelPercent < 95) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerState = false;
+    buzzerStartTime = 0;
+    Serial.println("AUTO BUZZER OFF: Water level is " + String(tankLevelPercent) + "% (>= 12%)");
+  }
+
+  // ADDITIONAL SAFETY AND HIGH LEVEL WARNING
+  if (tankLevelPercent >= 95) {
+    // Turn on buzzer for high level warning
+    if (!buzzerState) {
+      digitalWrite(BUZZER_PIN, HIGH);
+      buzzerState = true;
+      buzzerStartTime = millis();
+      Serial.println("HIGH LEVEL WARNING: Buzzer activated at " + String(tankLevelPercent) + "%");
+    }
+  }
+
+  // EMERGENCY: Tank overflow protection at 100%
+  if (tankLevelPercent >= 100) {
+    // Force pump OFF if tank is completely full
+    if (pumpState) {
+      pumpState = false;
+      digitalWrite(PUMP_RELAY_PIN, LOW);
+      Serial.println("EMERGENCY: Tank 100% full - Pump FORCED OFF!");
+      Blynk.virtualWrite(VPIN_PUMP_STATUS, 0);
+      Blynk.virtualWrite(VPIN_PUMP_CONTROL, 0);
+    }
+  }
+
+  Serial.println("   Pump status: " + String(pumpState ? "ON" : "OFF"));
+  Serial.println("   Current thresholds: ON<" + String(PUMP_ON_THRESHOLD) + "%, OFF>=" + String(PUMP_OFF_THRESHOLD) + "%");
+  Serial.println("========================================");
+
+  // Update display
+  drawOLED();
+
+  // Send data to Blynk app
+  Blynk.virtualWrite(VPIN_WATER_LEVEL, tankLevelPercent);
+  Blynk.virtualWrite(VPIN_PUMP_STATUS, pumpState ? 1 : 0);
+}
+
+// HTTP endpoint to get tank status as JSON
+void handleStatus() {
+  StaticJsonDocument<512> doc;
+
+  // Tank information
+  doc["tankLevel"] = tankLevelPercent;
+  doc["pumpStatus"] = pumpState ? "ON" : "OFF";
+  doc["sensorConnected"] = sensorConnected;
+  doc["tankHeight"] = TANK_HEIGHT_CM;
+  doc["waterHeight"] = (TANK_HEIGHT_CM * tankLevelPercent) / 100;
+
+  // Control thresholds
+  JsonObject thresholds = doc.createNestedObject("thresholds");
+  thresholds["pumpOn"] = PUMP_ON_THRESHOLD;
+  thresholds["pumpOff"] = PUMP_OFF_THRESHOLD;
+
+  // Status information
+  JsonObject status = doc.createNestedObject("status");
+  status["level"] = getTankStatus(tankLevelPercent);
+  status["color"] = getStatusColor(tankLevelPercent);
+  status["buzzer"] = buzzerState ? "ON" : "OFF";
+
+  // Alerts and recommendations
+  JsonArray alerts = doc.createNestedArray("alerts");
+  if (tankLevelPercent >= 100) {
+    alerts.add("TANK FULL - Emergency pump shutdown!");
+  } else if (tankLevelPercent >= 95) {
+    alerts.add("Tank high level - Pump will auto-stop");
+  } else if (tankLevelPercent <= 10) {
+    alerts.add("Very low water level - Pump will auto-start");
+  }
+
+  // System information
+  JsonObject system = doc.createNestedObject("system");
+  system["uptime"] = millis() / 1000;
+  system["lastSensorUpdate"] = (millis() - lastSensorUpdate) / 1000;
+  system["wifiStrength"] = WiFi.RSSI();
+
+  String response;
+  serializeJson(doc, response);
+
+  server.send(200, "application/json", response);
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  Serial.println("HTTP Status request served - Level: " + String(tankLevelPercent) + "%");
+}
+
+// HTTP endpoint to control pump
+void handlePumpControl() {
+  // Add CORS headers
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  
+  if (server.hasArg("action")) {
+    String action = server.arg("action");
+
+    if (action == "on") {
+      // Check if tank is not at high level before turning pump ON
+      if (tankLevelPercent < PUMP_OFF_THRESHOLD) {
+        pumpState = true;
+        digitalWrite(PUMP_RELAY_PIN, HIGH);
+        Blynk.virtualWrite(VPIN_PUMP_STATUS, 1);
+        Blynk.virtualWrite(VPIN_PUMP_CONTROL, 1);
+        server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"Pump turned ON\"}");
+        Serial.println("MANUAL: Pump turned ON via HTTP");
+      } else {
+        server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Cannot turn pump ON - Tank level is >= " + String(PUMP_OFF_THRESHOLD) + "%!\"}");
+        Serial.println("MANUAL: Cannot turn pump ON - Tank level is >= " + String(PUMP_OFF_THRESHOLD) + "%!");
+      }
+    } else if (action == "off") {
+      // Manual pump OFF is always allowed
+      pumpState = false;
+      digitalWrite(PUMP_RELAY_PIN, LOW);
+      Blynk.virtualWrite(VPIN_PUMP_STATUS, 0);
+      Blynk.virtualWrite(VPIN_PUMP_CONTROL, 0);
+      server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"Pump turned OFF\"}");
+      Serial.println("MANUAL: Pump turned OFF via HTTP");
+    } else {
+      server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid action\"}");
+    }
+
+    drawOLED();
+  } else {
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Missing action parameter\"}");
+  }
+}
+
+// HTTP endpoint to serve simple HTML dashboard
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>Tank Water Level Monitor</title>";
+  html += "<style>";
+  html += "body { font-family: Arial; margin: 20px; background: #f0f2f5; }";
+  html += ".container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }";
+  html += ".header { text-align: center; color: #2c3e50; margin-bottom: 30px; }";
+  html += ".level-display { text-align: center; margin: 30px 0; }";
+  html += ".tank { width: 150px; height: 200px; border: 3px solid #34495e; margin: 0 auto 20px; position: relative; border-radius: 5px; background: #ecf0f1; }";
+  html += ".water { position: absolute; bottom: 0; left: 0; right: 0; background: #3498db; border-radius: 0 0 2px 2px; transition: height 0.5s; }";
+  html += ".water.low { background: #e74c3c; }";
+  html += ".water.high { background: #27ae60; }";
+  html += ".percentage { font-size: 3em; font-weight: bold; color: #2c3e50; margin: 20px 0; }";
+  html += ".status { font-size: 1.2em; padding: 10px 20px; border-radius: 20px; display: inline-block; color: white; font-weight: bold; }";
+  html += ".status.green { background: #27ae60; }";
+  html += ".status.yellow { background: #f39c12; }";
+  html += ".status.orange { background: #e67e22; }";
+  html += ".status.red { background: #e74c3c; }";
+  html += ".controls { text-align: center; margin: 30px 0; }";
+  html += ".btn { padding: 15px 30px; margin: 10px; font-size: 1.1em; border: none; border-radius: 5px; cursor: pointer; color: white; font-weight: bold; }";
+  html += ".btn-on { background: #27ae60; }";
+  html += ".btn-off { background: #e74c3c; }";
+  html += ".btn:hover { opacity: 0.8; }";
+  html += ".info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin: 30px 0; }";
+  html += ".info-card { background: #f8f9fa; padding: 20px; border-radius: 8px; text-align: center; border: 1px solid #dee2e6; }";
+  html += ".info-card h3 { margin: 0 0 10px 0; color: #495057; }";
+  html += ".info-card p { margin: 0; font-size: 1.3em; font-weight: bold; color: #212529; }";
+  html += ".footer { text-align: center; margin-top: 30px; color: #6c757d; font-size: 0.9em; }";
+  html += "</style></head><body>";
+  
+  html += "<div class='container'>";
+  html += "<div class='header'><h1>Tank Water Level Monitor</h1><p>Real-time monitoring system</p></div>";
+  
+  html += "<div class='level-display'>";
+  html += "<div class='tank'><div class='water' id='water' style='height:" + String(tankLevelPercent) + "%'></div></div>";
+  html += "<div class='percentage' id='percentage'>" + String(tankLevelPercent) + "%</div>";
+  html += "<div class='status " + getStatusColor(tankLevelPercent) + "' id='status'>" + getTankStatus(tankLevelPercent) + "</div>";
+  html += "</div>";
+  
+  html += "<div style='text-align:center; margin:20px 0; padding:15px; background:#e8f4f8; border-radius:8px;'>";
+  html += "<strong>Auto Control:</strong> Pump ON < " + String(PUMP_ON_THRESHOLD) + "% | Pump OFF >= " + String(PUMP_OFF_THRESHOLD) + "%";
+  html += "</div>";
+  
+  html += "<div class='controls'>";
+  html += "<button class='btn btn-on' onclick='controlPump(\"on\")'>Turn Pump ON</button>";
+  html += "<button class='btn btn-off' onclick='controlPump(\"off\")'>Turn Pump OFF</button>";
+  html += "</div>";
+  
+  html += "<div class='info-grid'>";
+  html += "<div class='info-card'><h3>Water Height</h3><p id='waterHeight'>" + String((TANK_HEIGHT_CM * tankLevelPercent) / 100) + " cm</p></div>";
+  html += "<div class='info-card'><h3>Pump Status</h3><p id='pumpStatus'>" + String(pumpState ? "ON" : "OFF") + "</p></div>";
+  html += "<div class='info-card'><h3>Sensor Status</h3><p id='sensorStatus'>" + String(sensorConnected ? "Connected" : "Disconnected") + "</p></div>";
+  html += "<div class='info-card'><h3>Buzzer Status</h3><p id='buzzerStatus'>" + String(buzzerState ? "ON" : "OFF") + "</p></div>";
+  html += "</div>";
+  
+  html += "<div class='footer'>";
+  html += "Tank: " + String(TANK_HEIGHT_CM) + "cm | IP: " + WiFi.localIP().toString() + " | Signal: " + String(WiFi.RSSI()) + "dBm | Uptime: " + String(millis()/3600000) + "h " + String((millis()%3600000)/60000) + "m";
+  html += "</div>";
+  
+  html += "</div>";
+  
+  html += "<script>";
+  html += "function updateData() {";
+  html += "  fetch('/status').then(r => r.json()).then(data => {";
+  html += "    document.getElementById('percentage').textContent = data.tankLevel + '%';";
+  html += "    document.getElementById('status').textContent = data.status.level;";
+  html += "    document.getElementById('status').className = 'status ' + data.status.color;";
+  html += "    document.getElementById('water').style.height = data.tankLevel + '%';";
+  html += "    document.getElementById('water').className = 'water' + (data.tankLevel <= 20 ? ' low' : data.tankLevel >= 95 ? ' high' : '');";
+  html += "    document.getElementById('waterHeight').textContent = Math.round(data.waterHeight) + ' cm';";
+  html += "    document.getElementById('pumpStatus').textContent = data.pumpStatus;";
+  html += "    document.getElementById('sensorStatus').textContent = data.sensorConnected ? 'Connected' : 'Disconnected';";
+  html += "    document.getElementById('buzzerStatus').textContent = data.status.buzzer;";
+  html += "  }).catch(e => console.error('Error:', e));";
+  html += "}";
+  html += "function controlPump(action) {";
+  html += "  fetch('/pump?action=' + action).then(r => r.json()).then(data => {";
+  html += "    alert(data.message);";
+  html += "    if(data.status === 'success') setTimeout(updateData, 1000);";
+  html += "  }).catch(e => { console.error('Error:', e); alert('Error controlling pump'); });";
+  html += "}";
+  html += "setInterval(updateData, 5000);";
+  html += "</script>";
+  html += "</body></html>";
+
+  server.send(200, "text/html", html);
+  Serial.println("HTTP Dashboard request served");
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\nStarting Tank Water Level Monitor with ESP-NOW...");
+
+  // Initialize GPIO pins
+  pinMode(PUMP_RELAY_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(PUMP_RELAY_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // Initialize OLED display
+  u8g2.begin();
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB10_tr);
+  u8g2.drawStr(0, 15, "Tank Monitor");
+  u8g2.drawStr(0, 30, "Starting...");
+  u8g2.sendBuffer();
+
+  // Connect to WiFi
+  WiFi.begin(ssid, pass);
+  Serial.print("Connecting to WiFi");
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  Serial.println();
+  Serial.println("WiFi connected successfully!");
+  Serial.println("IP address: " + WiFi.localIP().toString());
+
+  // Initialize ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+
+  // Register callback function for receiving data
+  esp_now_register_recv_cb(OnDataRecv);
+  Serial.println("ESP-NOW initialized and ready to receive data");
+
+  // Initialize Blynk
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+  Serial.println("Blynk connected");
+
+  // Set up web server routes
+  server.on("/", handleRoot);
+  server.on("/status", handleStatus);
+  server.on("/pump", handlePumpControl);
+
+  // Enable CORS for all requests
+  server.enableCORS(true);
+
+  // Start web server
+  server.begin();
+  Serial.println("HTTP server started on port 80");
+
+  // Update OLED with ready status
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  u8g2.drawStr(0, 12, "System Ready");
+  u8g2.drawStr(0, 25, "WiFi Connected");
+  u8g2.drawStr(0, 38, WiFi.localIP().toString().c_str());
+  u8g2.drawStr(0, 51, "Waiting for");
+  u8g2.drawStr(0, 64, "sensor data...");
+  u8g2.sendBuffer();
+
+  Serial.println("========================================");
+  Serial.println("SYSTEM READY!");
+  Serial.println("Web Dashboard: http://" + WiFi.localIP().toString());
+  Serial.println("Status API: http://" + WiFi.localIP().toString() + "/status");
+  Serial.println("Pump Control: http://" + WiFi.localIP().toString() + "/pump?action=on/off");
+  Serial.println("Blynk App: Connected");
+  Serial.println("ESP-NOW: Listening for sensor data");
+  Serial.println("Auto Control Thresholds:");
+  Serial.println("   Pump ON: < " + String(PUMP_ON_THRESHOLD) + "%");
+  Serial.println("   Pump OFF: >= " + String(PUMP_OFF_THRESHOLD) + "%");
+  Serial.println("   Buzzer ON: < 12%");
+  Serial.println("   Buzzer OFF: >= 12% (except high level)");
+  Serial.println("========================================");
+}
+
+void loop() {
+  // Handle Blynk connection
+  Blynk.run();
+  
+  // Handle web server
+  server.handleClient();
+
+  // Check sensor timeout
+  if (millis() - lastSensorUpdate > SENSOR_TIMEOUT && sensorConnected) {
+    sensorConnected = false;
+    Serial.println("Sensor connection timeout!");
+    drawOLED();
+  }
+
+  // Handle buzzer timeout (auto turn off after 5 minutes)
+  if (buzzerState && buzzerStartTime > 0 && (millis() - buzzerStartTime > 300000)) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerState = false;
+    buzzerStartTime = 0;
+    Serial.println("Buzzer auto-timeout after 5 minutes");
+    drawOLED();
+  }
+
+  delay(100);
+}
